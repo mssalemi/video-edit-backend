@@ -1,0 +1,10 @@
+services:
+  transcriber:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/data
+    environment:
+      - TRANSCRIBE_DEFAULT_MODEL=small
+      - TRANSCRIBE_TMP_DIR=/tmp/transcriber
