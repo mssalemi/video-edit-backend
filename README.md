@@ -10,6 +10,7 @@ A local-first, containerized transcription API using FastAPI, ffmpeg, and faster
 - **Marker-based boundaries**: Use verbal cues like "cut" or "restart" to control clip boundaries
 - **Punchline boost**: Fun clips prefer short, punchy segments with exclamations
 - **EDL rendering**: Stitch multiple keep ranges into one video, cutting out mess-ups
+- **AI planning layer**: Generate edit plans with stub/heuristic/AI modes
 - Trim video clips by time range
 - Full auto-clip pipeline: transcribe -> select -> render
 - Two input modes: file path (for mounted volumes) or direct file upload
@@ -408,6 +409,120 @@ Response:
 - Set `reencode: true` if you encounter audio/video sync issues
 - Ranges that overlap or touch are automatically merged
 - Output `kept_ms` shows the final merged ranges actually rendered
+
+### Plan Edits (AI Planning Layer)
+
+Generate an edit plan (clips with keep ranges) from transcript segments. Supports three modes:
+
+**Stub mode** (for wiring/testing):
+```bash
+curl -X POST http://localhost:3000/plan-edits \
+  -H "Content-Type: application/json" \
+  -d '{
+    "segments": [
+      {"start": 0.0, "end": 10.0, "text": "Hello world"},
+      {"start": 10.0, "end": 20.0, "text": "More content here"}
+    ],
+    "mode": "stub"
+  }'
+```
+
+**Heuristic mode** (deterministic, no external APIs):
+```bash
+curl -X POST http://localhost:3000/plan-edits \
+  -H "Content-Type: application/json" \
+  -d '{
+    "segments": [
+      {"start": 0.0, "end": 10.0, "text": "Hello and welcome."},
+      {"start": 10.0, "end": 20.0, "text": "Let me restart that."},
+      {"start": 20.0, "end": 30.0, "text": "Okay, here is the real content."}
+    ],
+    "mode": "heuristic",
+    "max_clips": 2,
+    "markers": ["restart"]
+  }'
+```
+
+**AI mode** (returns 501 with prompt payload for external LLM):
+```bash
+curl -X POST http://localhost:3000/plan-edits \
+  -H "Content-Type: application/json" \
+  -d '{
+    "segments": [
+      {"start": 0.0, "end": 10.0, "text": "Hello world"}
+    ],
+    "mode": "ai"
+  }'
+```
+
+Response (heuristic mode):
+```json
+{
+  "clips": [
+    {
+      "clip_id": "550e8400-e29b-41d4-a716-446655440000",
+      "clip_type": "mixed",
+      "title": "Hello and welcome",
+      "keep_ms": [[0, 10000]],
+      "total_ms": 10000,
+      "reason": "heuristic: mixed selection",
+      "confidence": 0.7
+    }
+  ],
+  "meta": {
+    "planner": "heuristic",
+    "segments_in": 3,
+    "max_clips": 2
+  }
+}
+```
+
+Response (AI mode - 501):
+```json
+{
+  "detail": "AI planner not implemented yet",
+  "prompt": {
+    "system_prompt": "You are an expert video editor AI...",
+    "user_prompt": "Analyze the following transcript...",
+    "json_schema": {...},
+    "segments_compact": [...]
+  }
+}
+```
+
+**Parameters:**
+| Field | Default | Description |
+|-------|---------|-------------|
+| segments | required | Array of transcript segments |
+| mode | "heuristic" | Planner mode: "stub", "heuristic", or "ai" |
+| max_clips | 3 | Maximum clips to generate |
+| clip_types | ["document", "fun", "mixed"] | Allowed clip types |
+| preferred_clip_type | "mixed" | Preferred clip type |
+| markers | [] | Marker words for mess-up detection |
+| clean_level | "light" | Cleanup level: "none", "light", "aggressive" |
+| min_clip_ms | 6000 | Minimum clip duration (ms) |
+| max_clip_ms | 60000 | Maximum clip duration (ms) |
+| max_keep_ranges | 10 | Max keep ranges per clip |
+| enforce_segment_boundaries | true | Snap keep_ms to segment boundaries |
+
+**Planner Modes:**
+
+| Mode | Description |
+|------|-------------|
+| `stub` | Returns single clip covering entire transcript (for wiring) |
+| `heuristic` | Deterministic multi-clip plan using markers, topic shifts, or time buckets |
+| `ai` | Returns 501 with prompt payload for external LLM integration |
+
+**Heuristic Strategy:**
+1. If markers provided, split at marker segments
+2. Otherwise, detect topic shifts via gaps (>3s) or reset phrases ("restart", "take two", etc.)
+3. Fall back to equal time buckets
+4. For each chunk, use `select_clips` to find best window
+
+**Use Cases:**
+- Test integration before connecting AI backend
+- Deterministic clip planning for automation
+- Build prompt payload for external LLM services
 
 ## Workflow Examples
 

@@ -6,10 +6,18 @@ from typing import Literal, Optional
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
+from fastapi.responses import JSONResponse
+
 from app.settings import settings
 from app.transcribe import transcribe_media, trim_video
 from app.selection import select_clips
 from app.edl import render_edl
+from app.planner import (
+    validate_segments,
+    build_ai_plan_prompt,
+    plan_edits_stub,
+    plan_edits_heuristic,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -29,6 +37,7 @@ app = FastAPI(
 
 ClipType = Literal["document", "fun", "mixed"]
 CleanLevel = Literal["none", "light", "aggressive"]
+PlannerMode = Literal["stub", "heuristic", "ai"]
 
 
 # --- Pydantic Models ---
@@ -166,6 +175,44 @@ class RenderEdlResponse(BaseModel):
     kept_ms: list[list[int]]
     duration_s: float
     segments_rendered: int
+
+
+# --- Plan Edits Models ---
+
+
+class PlanEditsRequest(BaseModel):
+    segments: list[SegmentInput]
+    max_clips: int = 2
+    clip_types: list[str] = ["document", "fun", "mixed"]
+    preferred_clip_type: str = "document"
+    markers: list[str] = []
+    clean_level: CleanLevel = "light"
+    min_clip_ms: int = 6000
+    max_clip_ms: int = 60000
+    max_keep_ranges: int = 20
+    enforce_segment_boundaries: bool = True
+    mode: PlannerMode = "heuristic"
+
+
+class PlannedClip(BaseModel):
+    clip_id: str
+    clip_type: str
+    title: str
+    keep_ms: list[list[int]]
+    total_ms: int
+    reason: str
+    confidence: float
+
+
+class PlanEditsMeta(BaseModel):
+    planner: str
+    segments_in: int
+    max_clips: int
+
+
+class PlanEditsResponse(BaseModel):
+    clips: list[PlannedClip]
+    meta: PlanEditsMeta
 
 
 # --- Endpoints ---
@@ -585,4 +632,122 @@ async def render_edl_endpoint(request: RenderEdlRequest):
         raise HTTPException(
             status_code=500,
             detail="EDL render failed. Check server logs for details.",
+        )
+
+
+@app.post("/plan-edits", response_model=PlanEditsResponse)
+async def plan_edits_endpoint(request: PlanEditsRequest):
+    """
+    Generate an edit plan from transcript segments.
+
+    Returns a list of planned clips, each with keep_ms ranges.
+    This enables cutting out mess-ups within longer clips.
+
+    Modes:
+    - "stub": Returns trivial one-clip plan (for wiring/testing)
+    - "heuristic": Deterministic multi-clip plan without AI
+    - "ai": Builds prompt and returns 501 (AI not implemented yet)
+
+    The response can be used with /render-edl to produce final clips.
+    """
+    try:
+        mode = request.mode or "heuristic"
+        logger.info(
+            f"Received plan-edits request: {len(request.segments)} segments, "
+            f"mode={mode}, max_clips={request.max_clips}"
+        )
+
+        # Validate inputs
+        if not request.segments:
+            raise HTTPException(
+                status_code=400,
+                detail="segments list cannot be empty",
+            )
+
+        if request.max_clips < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="max_clips must be at least 1",
+            )
+
+        if request.min_clip_ms >= request.max_clip_ms:
+            raise HTTPException(
+                status_code=400,
+                detail="min_clip_ms must be less than max_clip_ms",
+            )
+
+        if request.preferred_clip_type not in request.clip_types:
+            raise HTTPException(
+                status_code=400,
+                detail=f"preferred_clip_type '{request.preferred_clip_type}' must be in clip_types",
+            )
+
+        # Convert pydantic models to dicts
+        segments = [s.model_dump() for s in request.segments]
+
+        # Validate segments structure
+        try:
+            validate_segments(segments)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        # Handle modes
+        if mode == "stub":
+            result = plan_edits_stub(
+                segments=segments,
+                preferred_clip_type=request.preferred_clip_type,
+            )
+            return result
+
+        elif mode == "heuristic":
+            result = plan_edits_heuristic(
+                segments=segments,
+                max_clips=request.max_clips,
+                clip_types=request.clip_types,
+                preferred_clip_type=request.preferred_clip_type,
+                markers=request.markers,
+                clean_level=request.clean_level,
+                min_clip_ms=request.min_clip_ms,
+                max_clip_ms=request.max_clip_ms,
+                max_keep_ranges=request.max_keep_ranges,
+                enforce_segment_boundaries=request.enforce_segment_boundaries,
+            )
+            return result
+
+        elif mode == "ai":
+            # Build prompt but don't call AI yet
+            prompt_payload = build_ai_plan_prompt(
+                segments=segments,
+                max_clips=request.max_clips,
+                clip_types=request.clip_types,
+                preferred_clip_type=request.preferred_clip_type,
+                markers=request.markers,
+                clean_level=request.clean_level,
+                min_clip_ms=request.min_clip_ms,
+                max_clip_ms=request.max_clip_ms,
+                max_keep_ranges=request.max_keep_ranges,
+                enforce_segment_boundaries=request.enforce_segment_boundaries,
+            )
+
+            return JSONResponse(
+                status_code=501,
+                content={
+                    "detail": "AI planner not implemented yet",
+                    "prompt": prompt_payload,
+                },
+            )
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid mode: {mode}. Must be 'stub', 'heuristic', or 'ai'",
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Plan edits failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Plan edits failed. Check server logs for details.",
         )
