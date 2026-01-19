@@ -1,6 +1,8 @@
 services:
   transcriber:
     build: .
+    env_file:
+      - .env
     ports:
       - "3000:3000"
     volumes:
@@ -8,3 +10,4 @@ services:
     environment:
       - TRANSCRIBE_DEFAULT_MODEL=small
       - TRANSCRIBE_TMP_DIR=/tmp/transcriber
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}

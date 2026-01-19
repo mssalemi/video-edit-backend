@@ -5,6 +5,7 @@ A local-first, containerized transcription API using FastAPI, ffmpeg, and faster
 ## Features
 
 - Transcribe video/audio files to text with segment timestamps
+- **Chunked transcription**: Split long segments into smaller chunks for finer editing control
 - Automatic clip selection using heuristics (no external APIs)
 - **Content-aware cleanup**: Skip filler words, fluffy intros, and bad segments
 - **Marker-based boundaries**: Use verbal cues like "cut" or "restart" to control clip boundaries
@@ -27,6 +28,18 @@ docker compose up --build
 The API will be available at `http://localhost:3000`.
 
 ## API Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/health` | Health check |
+| POST | `/transcribe` | Transcribe media file by path |
+| POST | `/transcribe/upload` | Transcribe uploaded file |
+| POST | `/select-clips` | Select best clips from segments |
+| POST | `/trim` | Trim video by time range |
+| POST | `/auto-clip` | Full pipeline: transcribe → select → render |
+| POST | `/render-edl` | Stitch keep ranges, cut out mess-ups |
+| POST | `/plan-edits` | AI planning layer (stub/heuristic/ai modes) |
+| POST | `/make-clips` | **NEW:** One-call AI pipeline: transcribe → plan → render |
 
 ### Health Check
 
@@ -57,6 +70,14 @@ curl -X POST http://localhost:3000/transcribe \
   -d '{"path": "/data/sample.mp4", "language": "en", "model": "base"}'
 ```
 
+With chunked granularity (splits long segments >3s into smaller chunks):
+
+```bash
+curl -X POST http://localhost:3000/transcribe \
+  -H "Content-Type: application/json" \
+  -d '{"path": "/data/sample.mp4", "granularity": "chunked"}'
+```
+
 ### Transcribe via File Upload
 
 ```bash
@@ -71,6 +92,14 @@ curl -X POST http://localhost:3000/transcribe/upload \
   -F "file=@./data/sample.mp4" \
   -F "language=en" \
   -F "model=small"
+```
+
+With chunked granularity:
+
+```bash
+curl -X POST http://localhost:3000/transcribe/upload \
+  -F "file=@./data/sample.mp4" \
+  -F "granularity=chunked"
 ```
 
 ### Transcription Response Format
@@ -98,10 +127,28 @@ curl -X POST http://localhost:3000/transcribe/upload \
     "language": "en",
     "duration_s": 10.5,
     "engine": "faster-whisper",
-    "model": "small"
+    "model": "small",
+    "granularity": "default"
   }
 }
 ```
+
+**Transcription Parameters:**
+| Field | Default | Description |
+|-------|---------|-------------|
+| path | required | Path to media file (for `/transcribe`) |
+| file | required | Uploaded file (for `/transcribe/upload`) |
+| language | auto | Language code (e.g., "en", "es") or auto-detect |
+| model | "small" | Whisper model: tiny, base, small, medium, large |
+| granularity | "default" | `"default"` or `"chunked"` - chunked splits segments >3s |
+
+**Granularity Options:**
+| Value | Behavior |
+|-------|----------|
+| `"default"` | Return segments as-is from Whisper |
+| `"chunked"` | Split segments longer than 3000ms into smaller chunks by word boundaries |
+
+Chunked mode is useful when you need finer-grained timestamps for precise editing or AI planning.
 
 ### Select Clips from Segments
 
@@ -412,7 +459,7 @@ Response:
 
 ### Plan Edits (AI Planning Layer)
 
-Generate an edit plan (clips with keep ranges) from transcript segments. Supports three modes:
+Generate an edit plan (clips with keep ranges) from transcript segments. Supports four modes:
 
 **Stub mode** (for wiring/testing):
 ```bash
@@ -443,15 +490,62 @@ curl -X POST http://localhost:3000/plan-edits \
   }'
 ```
 
-**AI mode** (returns 501 with prompt payload for external LLM):
+**AI mode** (calls Claude API to generate intelligent edit plans):
 ```bash
 curl -X POST http://localhost:3000/plan-edits \
   -H "Content-Type: application/json" \
   -d '{
     "segments": [
-      {"start": 0.0, "end": 10.0, "text": "Hello world"}
+      {"start": 0.0, "end": 10.0, "text": "Hello world"},
+      {"start": 10.5, "end": 15.0, "text": "Uh let me restart that"},
+      {"start": 15.5, "end": 25.0, "text": "Here is the actual content you want"}
     ],
-    "mode": "ai"
+    "mode": "ai",
+    "markers": ["restart"]
+  }'
+```
+
+> **Note:** AI mode requires `ANTHROPIC_API_KEY` to be set. It uses Claude to detect mess-ups and plan edits intelligently.
+
+**AI Labels mode** (labels segments, then deterministic code converts to clips):
+```bash
+curl -X POST http://localhost:3000/plan-edits \
+  -H "Content-Type: application/json" \
+  -d '{
+    "segments": [
+      {"start": 0.0, "end": 5.0, "text": "Today we will discuss Python."},
+      {"start": 5.0, "end": 10.0, "text": "Uh wait, let me restart that."},
+      {"start": 10.0, "end": 15.0, "text": "Today we will discuss Python programming."},
+      {"start": 15.0, "end": 20.0, "text": "Python is a great language!"},
+      {"start": 20.0, "end": 25.0, "text": "Now let me talk about JavaScript."},
+      {"start": 25.0, "end": 30.0, "text": "JavaScript is also popular."}
+    ],
+    "mode": "ai_labels",
+    "max_clips": 2
+  }'
+```
+
+> **Note:** AI Labels mode asks Claude to classify each segment (keep/cut/unsure + tags + story_id), then deterministic code converts labels to clips. This is better for detecting retakes where earlier content should be cut and later versions kept.
+
+**AI Labels with debug output** (see the labels and which segments formed each clip):
+```bash
+curl -X POST http://localhost:3000/plan-edits \
+  -H "Content-Type: application/json" \
+  -d '{
+    "segments": [...],
+    "mode": "ai_labels",
+    "debug": true
+  }'
+```
+
+**AI Labels with custom unsure_policy** (control how uncertain segments are handled):
+```bash
+curl -X POST http://localhost:3000/plan-edits \
+  -H "Content-Type: application/json" \
+  -d '{
+    "segments": [...],
+    "mode": "ai_labels",
+    "unsure_policy": "adjacent"
   }'
 ```
 
@@ -477,15 +571,56 @@ Response (heuristic mode):
 }
 ```
 
-Response (AI mode - 501):
+Response (AI mode):
 ```json
 {
-  "detail": "AI planner not implemented yet",
-  "prompt": {
-    "system_prompt": "You are an expert video editor AI...",
-    "user_prompt": "Analyze the following transcript...",
-    "json_schema": {...},
-    "segments_compact": [...]
+  "clips": [
+    {
+      "clip_id": "a1b2c3d4-...",
+      "clip_type": "document",
+      "title": "Actual Content",
+      "keep_ms": [[15500, 25000]],
+      "total_ms": 9500,
+      "reason": "Skipped restart section, kept coherent content",
+      "confidence": 0.85
+    }
+  ],
+  "meta": {
+    "planner": "ai",
+    "segments_in": 3,
+    "max_clips": 2
+  }
+}
+```
+
+Response (AI Labels mode):
+```json
+{
+  "clips": [
+    {
+      "clip_id": "e5f6g7h8-...",
+      "clip_type": "mixed",
+      "title": "Today we will discuss Python",
+      "keep_ms": [[10000, 20000]],
+      "total_ms": 10000,
+      "reason": "ai_labels: story 1, tags: ['clean_story']",
+      "confidence": 0.85
+    },
+    {
+      "clip_id": "i9j0k1l2-...",
+      "clip_type": "mixed",
+      "title": "Now let me talk about JavaScript",
+      "keep_ms": [[20000, 30000]],
+      "total_ms": 10000,
+      "reason": "ai_labels: story 2, tags: ['topic_shift', 'clean_story']",
+      "confidence": 0.85
+    }
+  ],
+  "meta": {
+    "planner": "ai_labels",
+    "segments_in": 6,
+    "max_clips": 2,
+    "labels_count": 6
   }
 }
 ```
@@ -494,7 +629,7 @@ Response (AI mode - 501):
 | Field | Default | Description |
 |-------|---------|-------------|
 | segments | required | Array of transcript segments |
-| mode | "heuristic" | Planner mode: "stub", "heuristic", or "ai" |
+| mode | "heuristic" | Planner mode: "stub", "heuristic", "ai", or "ai_labels" |
 | max_clips | 3 | Maximum clips to generate |
 | clip_types | ["document", "fun", "mixed"] | Allowed clip types |
 | preferred_clip_type | "mixed" | Preferred clip type |
@@ -504,6 +639,10 @@ Response (AI mode - 501):
 | max_clip_ms | 60000 | Maximum clip duration (ms) |
 | max_keep_ranges | 10 | Max keep ranges per clip |
 | enforce_segment_boundaries | true | Snap keep_ms to segment boundaries |
+| unsure_policy | (by clip type) | ai_labels only: "keep", "cut", or "adjacent" |
+| debug | false | ai_labels only: include labels and clip_sources in meta |
+| lead_in_ms | 300 | Expand keep range starts by this amount (clamp to bounds) |
+| tail_out_ms | 300 | Expand keep range ends by this amount (clamp to bounds) |
 
 **Planner Modes:**
 
@@ -511,7 +650,91 @@ Response (AI mode - 501):
 |------|-------------|
 | `stub` | Returns single clip covering entire transcript (for wiring) |
 | `heuristic` | Deterministic multi-clip plan using markers, topic shifts, or time buckets |
-| `ai` | Returns 501 with prompt payload for external LLM integration |
+| `ai` | Calls Claude API to intelligently detect mess-ups and plan edits |
+| `ai_labels` | Claude labels each segment (keep/cut + tags + story_id), then deterministic code converts to clips. Best for retake detection. |
+
+**Unsure Policy (ai_labels only):**
+
+When the AI labels a segment as "unsure", this policy determines what to do:
+
+| Policy | Behavior | Default For |
+|--------|----------|-------------|
+| `"keep"` | Treat unsure as keep (conservative) | "document" clips |
+| `"cut"` | Treat unsure as cut (aggressive) | "fun" clips |
+| `"adjacent"` | Keep if neighbors keep, cut if neighbors cut | "mixed" clips |
+
+**Debug Output (ai_labels only):**
+
+When `debug: true`, the response includes extra metadata:
+
+```json
+{
+  "clips": [...],
+  "meta": {
+    "planner": "ai_labels",
+    "labels": [
+      {"idx": 0, "action": "keep", "tags": ["intro"], "story_id": 1},
+      {"idx": 1, "action": "cut", "tags": ["retake_repeat"], "story_id": 1},
+      {"idx": 2, "action": "keep", "tags": ["clean_story"], "story_id": 1}
+    ],
+    "clip_sources": [
+      {
+        "clip_index": 0,
+        "story_id": 1,
+        "kept_segment_indexes": [0, 2],
+        "cut_segment_indexes": [1]
+      }
+    ],
+    "unsure_policy": "keep"
+  }
+}
+```
+
+This is useful for debugging why certain segments were included or excluded.
+
+**Validation & Fallback (ai_labels):**
+
+AI-generated clips are automatically validated. If validation fails (empty output, out of bounds, etc.), the system falls back to heuristic mode. Check `meta.planner` to see which mode was actually used:
+- `"ai_labels"` - AI labels were used successfully
+- `"ai_labels_fallback"` - Fell back to heuristic (check `meta.fallback_reason`)
+
+**Post-Processing (ai_labels):**
+
+After AI labels are converted to clips, several deterministic post-processing steps are applied to produce cleaner, more publishable output:
+
+1. **Label Normalization** — Tags that indicate bad content force `action="cut"` regardless of what the AI returned:
+   - Cut-forcing tags: `false_start`, `retake_repeat`, `filler`, `restart_phrase`, `garbled`, `non_story`, `meta_commentary`, `outro`
+   - Example: `{"action": "unsure", "tags": ["false_start"]}` → normalized to `{"action": "cut", "tags": ["false_start"]}`
+   - Unknown/invalid tags are dropped silently
+   - This prevents "unsure + bad tag" segments from being kept due to `unsure_policy=keep`
+
+2. **Outro Auto-Cut** — Segments containing common wrap-up phrases are automatically marked as "cut" with an "outro" tag:
+   - "let's see", "that's it", "anyway", "cool", "ok bye", "alright so", "alright then", "so yeah", "yeah so"
+   - Short segments (<30 chars) containing these phrases are also cut
+   - Prevents awkward "umm, let's see..." endings in clips
+
+3. **Trailing Unsure Trimming** (document mode only) — Removes trailing "unsure" segments from clip ends:
+   - Only applies when `preferred_clip_type == "document"` or `unsure_policy == "keep"`
+   - If the last N segments in a clip were originally labeled "unsure" by the AI, they are trimmed
+   - Prevents clips ending with mumbling, trailing thoughts, or uncertain content
+   - Will not trim if it would make the clip shorter than `min_clip_ms`
+
+4. **Smart Lead-in Range Drop** — For clips with multiple keep ranges, short "lead-in" ranges at the start are intelligently removed:
+   - If the first range is <2500ms and there are 2+ ranges, it may be dropped
+   - **Exceptions** (first range is kept if):
+     - The range contains 2+ kept segments
+     - Any segment in the range has a `clean_story` tag
+   - Prevents clips starting with a tiny fragment before the main content
+   - Example: `[[0, 2000], [10000, 25000]]` → `[[10000, 25000]]` (unless exceptions apply)
+
+5. **Keep Range Expansion** — Keep ranges are expanded by `lead_in_ms` and `tail_out_ms`:
+   - Start of each range is moved earlier by `lead_in_ms` (default: 300ms)
+   - End of each range is moved later by `tail_out_ms` (default: 300ms)
+   - Expansion is clamped to transcript bounds
+   - Expanded positions are snapped to nearest segment boundaries
+   - Creates more natural cuts that don't start/end abruptly mid-word
+
+These rules run automatically in the order listed. They are designed to handle common issues in selfie/talking-head videos where creators trail off, have false starts, or AI labels segments as uncertain.
 
 **Heuristic Strategy:**
 1. If markers provided, split at marker segments
@@ -520,9 +743,119 @@ Response (AI mode - 501):
 4. For each chunk, use `select_clips` to find best window
 
 **Use Cases:**
-- Test integration before connecting AI backend
-- Deterministic clip planning for automation
-- Build prompt payload for external LLM services
+- Test integration with stub mode before going live
+- Deterministic clip planning with heuristic mode (no API costs)
+- Intelligent mess-up detection with AI mode (requires ANTHROPIC_API_KEY)
+
+**Chaining transcribe → plan-edits:**
+
+```bash
+# 1. Transcribe and save to file
+curl -s -X POST http://localhost:3000/transcribe \
+  -H "Content-Type: application/json" \
+  -d '{"path": "/data/my-video.MOV", "granularity": "chunked"}' \
+  > /tmp/chunked.json
+
+# 2. Pipe segments into plan-edits
+python3 -c '
+import json
+d = json.load(open("/tmp/chunked.json"))
+print(json.dumps({
+  "segments": [{"start": s["start"], "end": s["end"], "text": s["text"]} for s in d["segments"]],
+  "mode": "ai_labels",
+  "max_clips": 2,
+  "preferred_clip_type": "document",
+  "lead_in_ms": 800,
+  "tail_out_ms": 800
+}))
+' | curl -s -X POST http://localhost:3000/plan-edits \
+  -H "Content-Type: application/json" \
+  -d @- | python3 -m json.tool
+```
+
+### Make Clips (One-Call Pipeline)
+
+New one-call endpoint that orchestrates the full clip creation workflow: transcribe → plan-edits → render.
+
+```bash
+curl -X POST http://localhost:3000/make-clips \
+  -H "Content-Type: application/json" \
+  -d '{
+    "path": "/data/my-video.MOV",
+    "output_prefix": "my_video"
+  }'
+```
+
+With options:
+
+```bash
+curl -X POST http://localhost:3000/make-clips \
+  -H "Content-Type: application/json" \
+  -d '{
+    "path": "/data/my-video.MOV",
+    "output_prefix": "my_video",
+    "max_clips": 3,
+    "preferred_clip_type": "document",
+    "min_clip_ms": 10000,
+    "max_clip_ms": 45000,
+    "lead_in_ms": 500,
+    "tail_out_ms": 300
+  }'
+```
+
+Response:
+```json
+{
+  "clips": [
+    {
+      "clip_id": "a1b2c3d4-...",
+      "output_path": "/data/my_video_clip1.mp4",
+      "keep_ms": [[5000, 20000]],
+      "total_ms": 15000,
+      "title": "Today we will discuss Python"
+    },
+    {
+      "clip_id": "e5f6g7h8-...",
+      "output_path": "/data/my_video_clip2.mp4",
+      "keep_ms": [[25000, 40000]],
+      "total_ms": 15000,
+      "title": "Now let me talk about JavaScript"
+    }
+  ],
+  "meta": {
+    "input_path": "/data/my-video.MOV",
+    "output_prefix": "my_video",
+    "segments_transcribed": 12,
+    "clips_planned": 2,
+    "clips_rendered": 2,
+    "planner": "ai_labels"
+  }
+}
+```
+
+**Parameters:**
+| Field | Default | Description |
+|-------|---------|-------------|
+| path | required | Path to input video |
+| output_prefix | required | Prefix for output filenames (e.g., "my_video" → my_video_clip1.mp4) |
+| max_clips | 2 | Maximum clips to generate |
+| preferred_clip_type | "document" | Preferred clip type |
+| markers | [] | Marker words for mess-up detection |
+| min_clip_ms | 6000 | Minimum clip duration (ms) |
+| max_clip_ms | 60000 | Maximum clip duration (ms) |
+| unsure_policy | (by clip type) | How to handle uncertain segments |
+| lead_in_ms | 300 | Expand clip starts by this amount |
+| tail_out_ms | 300 | Expand clip ends by this amount |
+| model | settings default | Whisper model for transcription |
+| language | auto | Language code for transcription |
+
+**Key Features:**
+- **Deterministic filenames**: Output files are named `<output_prefix>_clip1.mp4`, `<output_prefix>_clip2.mp4`, etc.
+- **Uses ai_labels mode**: Leverages Claude API for intelligent segment labeling
+- **Full post-processing**: Includes label normalization, lead-in/tail-out expansion, bridge range dropping
+- **Automatic cleanup**: Applies outro auto-cut and trailing unsure trimming
+
+> **Note:** Requires `ANTHROPIC_API_KEY` to be set.
 
 ## Workflow Examples
 
@@ -575,12 +908,14 @@ Available Whisper models (via faster-whisper):
 
 ## Configuration
 
-Environment variables (set in `docker-compose.yml`):
+Environment variables (set in `docker-compose.yml` or `.env`):
 
 | Variable                | Default           | Description                |
 |------------------------|-------------------|----------------------------|
 | TRANSCRIBE_DEFAULT_MODEL | small            | Default Whisper model      |
 | TRANSCRIBE_TMP_DIR     | /tmp/transcriber  | Temp directory for processing |
+| MAX_SEGMENT_MS         | 3000              | Max segment duration for chunked mode (ms) |
+| ANTHROPIC_API_KEY      | (none)            | API key for AI planner mode |
 
 ## Development
 

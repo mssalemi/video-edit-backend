@@ -17,6 +17,8 @@ from app.planner import (
     build_ai_plan_prompt,
     plan_edits_stub,
     plan_edits_heuristic,
+    plan_edits_ai,
+    plan_edits_ai_labels,
 )
 
 # Configure logging
@@ -37,7 +39,9 @@ app = FastAPI(
 
 ClipType = Literal["document", "fun", "mixed"]
 CleanLevel = Literal["none", "light", "aggressive"]
-PlannerMode = Literal["stub", "heuristic", "ai"]
+PlannerMode = Literal["stub", "heuristic", "ai", "ai_labels"]
+UnsurePolicy = Literal["keep", "cut", "adjacent"]
+Granularity = Literal["default", "chunked"]
 
 
 # --- Pydantic Models ---
@@ -51,6 +55,7 @@ class TranscribeRequest(BaseModel):
     path: str
     language: Optional[str] = None
     model: Optional[str] = None
+    granularity: Optional[Granularity] = "default"
 
 
 class SegmentResponse(BaseModel):
@@ -66,6 +71,7 @@ class MetaResponse(BaseModel):
     duration_s: Optional[float]
     engine: str
     model: str
+    granularity: Optional[str] = None
 
 
 class TranscribeResponse(BaseModel):
@@ -192,6 +198,10 @@ class PlanEditsRequest(BaseModel):
     max_keep_ranges: int = 20
     enforce_segment_boundaries: bool = True
     mode: PlannerMode = "heuristic"
+    unsure_policy: Optional[UnsurePolicy] = None  # ai_labels mode only; defaults by clip type
+    debug: bool = False  # ai_labels mode only; include labels and clip_sources in meta
+    lead_in_ms: int = 300  # Expand keep range start by this amount (clamp to bounds, snap to segment)
+    tail_out_ms: int = 300  # Expand keep range end by this amount (clamp to bounds, snap to segment)
 
 
 class PlannedClip(BaseModel):
@@ -208,11 +218,57 @@ class PlanEditsMeta(BaseModel):
     planner: str
     segments_in: int
     max_clips: int
+    # Optional fields for ai_labels mode
+    labels_count: Optional[int] = None
+    unsure_policy: Optional[str] = None
+    fallback_reason: Optional[str] = None
+    # Debug fields (only present when debug=True)
+    labels: Optional[list[dict]] = None
+    clip_sources: Optional[list[dict]] = None
+
+    class Config:
+        extra = "allow"  # Allow additional fields from planner
 
 
 class PlanEditsResponse(BaseModel):
     clips: list[PlannedClip]
     meta: PlanEditsMeta
+
+
+# --- Make Clips Models ---
+
+
+class MakeClipsRequest(BaseModel):
+    """Request model for the make-clips one-call pipeline."""
+    path: str  # Video file path (must be accessible in container)
+    output_prefix: str  # Prefix for output filenames, e.g., "my_video" -> my_video_clip1.mp4
+    # Optional plan-edits parameters
+    max_clips: int = 2
+    preferred_clip_type: str = "document"
+    markers: list[str] = []
+    min_clip_ms: int = 6000
+    max_clip_ms: int = 60000
+    unsure_policy: Optional[UnsurePolicy] = None
+    lead_in_ms: int = 300
+    tail_out_ms: int = 300
+    # Transcription settings
+    model: Optional[str] = None  # Whisper model (default from settings)
+    language: Optional[str] = None
+
+
+class MakeClipsClipResult(BaseModel):
+    """Result for a single generated clip."""
+    clip_id: str
+    output_path: str
+    keep_ms: list[list[int]]
+    total_ms: int
+    title: str
+
+
+class MakeClipsResponse(BaseModel):
+    """Response model for make-clips endpoint."""
+    clips: list[MakeClipsClipResult]
+    meta: dict
 
 
 # --- Endpoints ---
@@ -242,8 +298,8 @@ async def transcribe_path(request: TranscribeRequest):
             )
 
         # Perform transcription
-        logger.info(f"Starting transcription: path={request.path}, model={request.model}, language={request.language}")
-        result = transcribe_media(request.path, request.model, request.language)
+        logger.info(f"Starting transcription: path={request.path}, model={request.model}, language={request.language}, granularity={request.granularity}")
+        result = transcribe_media(request.path, request.model, request.language, request.granularity)
 
         return result
 
@@ -262,11 +318,13 @@ async def transcribe_upload(
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
+    granularity: Optional[str] = Form("default"),
 ):
     """
     Transcribe an uploaded media file.
 
-    Upload a file via multipart form with optional language and model fields.
+    Upload a file via multipart form with optional language, model, and granularity fields.
+    Set granularity="chunked" to split long segments (>3000ms) into smaller chunks.
     """
     tmp_upload_path: Optional[str] = None
 
@@ -288,8 +346,8 @@ async def transcribe_upload(
             tmp_file.write(content)
 
         # Perform transcription
-        logger.info(f"Starting transcription: path={tmp_upload_path}, model={model}, language={language}")
-        result = transcribe_media(tmp_upload_path, model, language)
+        logger.info(f"Starting transcription: path={tmp_upload_path}, model={model}, language={language}, granularity={granularity}")
+        result = transcribe_media(tmp_upload_path, model, language, granularity)
 
         return result
 
@@ -646,7 +704,9 @@ async def plan_edits_endpoint(request: PlanEditsRequest):
     Modes:
     - "stub": Returns trivial one-clip plan (for wiring/testing)
     - "heuristic": Deterministic multi-clip plan without AI
-    - "ai": Builds prompt and returns 501 (AI not implemented yet)
+    - "ai": Calls Claude API to generate edit plans with timestamps
+    - "ai_labels": Calls Claude to label segments (keep/cut/unsure), then
+      deterministic code converts labels to clips. Better for retake detection.
 
     The response can be used with /render-edl to produce final clips.
     """
@@ -715,32 +775,51 @@ async def plan_edits_endpoint(request: PlanEditsRequest):
             return result
 
         elif mode == "ai":
-            # Build prompt but don't call AI yet
-            prompt_payload = build_ai_plan_prompt(
-                segments=segments,
-                max_clips=request.max_clips,
-                clip_types=request.clip_types,
-                preferred_clip_type=request.preferred_clip_type,
-                markers=request.markers,
-                clean_level=request.clean_level,
-                min_clip_ms=request.min_clip_ms,
-                max_clip_ms=request.max_clip_ms,
-                max_keep_ranges=request.max_keep_ranges,
-                enforce_segment_boundaries=request.enforce_segment_boundaries,
-            )
+            # Call Claude API for AI planning
+            try:
+                result = plan_edits_ai(
+                    segments=segments,
+                    max_clips=request.max_clips,
+                    clip_types=request.clip_types,
+                    preferred_clip_type=request.preferred_clip_type,
+                    markers=request.markers,
+                    clean_level=request.clean_level,
+                    min_clip_ms=request.min_clip_ms,
+                    max_clip_ms=request.max_clip_ms,
+                    max_keep_ranges=request.max_keep_ranges,
+                    enforce_segment_boundaries=request.enforce_segment_boundaries,
+                )
+                return result
+            except ValueError as e:
+                raise HTTPException(status_code=500, detail=str(e))
 
-            return JSONResponse(
-                status_code=501,
-                content={
-                    "detail": "AI planner not implemented yet",
-                    "prompt": prompt_payload,
-                },
-            )
+        elif mode == "ai_labels":
+            # Call Claude API to label segments, then convert to clips deterministically
+            try:
+                result = plan_edits_ai_labels(
+                    segments=segments,
+                    max_clips=request.max_clips,
+                    clip_types=request.clip_types,
+                    preferred_clip_type=request.preferred_clip_type,
+                    markers=request.markers,
+                    clean_level=request.clean_level,
+                    min_clip_ms=request.min_clip_ms,
+                    max_clip_ms=request.max_clip_ms,
+                    max_keep_ranges=request.max_keep_ranges,
+                    enforce_segment_boundaries=request.enforce_segment_boundaries,
+                    unsure_policy=request.unsure_policy,
+                    debug=request.debug,
+                    lead_in_ms=request.lead_in_ms,
+                    tail_out_ms=request.tail_out_ms,
+                )
+                return result
+            except ValueError as e:
+                raise HTTPException(status_code=500, detail=str(e))
 
         else:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid mode: {mode}. Must be 'stub', 'heuristic', or 'ai'",
+                detail=f"Invalid mode: {mode}. Must be 'stub', 'heuristic', 'ai', or 'ai_labels'",
             )
 
     except HTTPException:
@@ -750,4 +829,155 @@ async def plan_edits_endpoint(request: PlanEditsRequest):
         raise HTTPException(
             status_code=500,
             detail="Plan edits failed. Check server logs for details.",
+        )
+
+
+@app.post("/make-clips", response_model=MakeClipsResponse)
+async def make_clips_endpoint(request: MakeClipsRequest):
+    """
+    One-call pipeline: transcribe -> plan-edits -> render clips.
+
+    This endpoint orchestrates the full clip creation workflow:
+    1. Transcribes the input video
+    2. Plans edits using ai_labels mode
+    3. Renders each planned clip to a file
+
+    Output files are named deterministically: <output_prefix>_clip1.mp4, etc.
+
+    Requires ANTHROPIC_API_KEY for the AI planning step.
+    """
+    try:
+        logger.info(f"Received make-clips request: {request.path} -> {request.output_prefix}")
+
+        # Validate input path exists
+        if not os.path.exists(request.path):
+            raise HTTPException(
+                status_code=404,
+                detail=f"File not found: {request.path}",
+            )
+
+        # Check for API key
+        if not settings.ANTHROPIC_API_KEY:
+            raise HTTPException(
+                status_code=500,
+                detail="ANTHROPIC_API_KEY not configured. Required for make-clips.",
+            )
+
+        # Step 1: Transcribe
+        logger.info(f"Step 1: Transcribing {request.path}")
+        whisper_model = request.model or settings.DEFAULT_MODEL
+        transcription = transcribe_media(
+            request.path,
+            model=whisper_model,
+            language=request.language,
+            granularity="chunked",  # Always use chunked for better segment boundaries
+        )
+
+        if not transcription.get("segments"):
+            raise HTTPException(
+                status_code=400,
+                detail="Transcription produced no segments",
+            )
+
+        segments = transcription["segments"]
+        logger.info(f"Transcription complete: {len(segments)} segments")
+
+        # Step 2: Plan edits using ai_labels
+        logger.info(f"Step 2: Planning edits with ai_labels mode")
+        plan_result = plan_edits_ai_labels(
+            segments=segments,
+            max_clips=request.max_clips,
+            clip_types=["document", "fun", "mixed"],
+            preferred_clip_type=request.preferred_clip_type,
+            markers=request.markers,
+            clean_level="light",
+            min_clip_ms=request.min_clip_ms,
+            max_clip_ms=request.max_clip_ms,
+            max_keep_ranges=20,
+            enforce_segment_boundaries=True,
+            unsure_policy=request.unsure_policy,
+            debug=False,
+            lead_in_ms=request.lead_in_ms,
+            tail_out_ms=request.tail_out_ms,
+        )
+
+        planned_clips = plan_result.get("clips", [])
+        if not planned_clips:
+            raise HTTPException(
+                status_code=400,
+                detail="Planning produced no clips",
+            )
+
+        logger.info(f"Planning complete: {len(planned_clips)} clips")
+
+        # Step 3: Render each clip
+        logger.info(f"Step 3: Rendering {len(planned_clips)} clips")
+        input_dir = os.path.dirname(request.path)
+        results = []
+
+        for i, clip in enumerate(planned_clips):
+            clip_num = i + 1
+            output_filename = f"{request.output_prefix}_clip{clip_num}.mp4"
+            output_path = os.path.join(input_dir, output_filename)
+
+            keep_ms = clip.get("keep_ms", [])
+            if not keep_ms:
+                logger.warning(f"Clip {clip_num} has no keep_ms, skipping")
+                continue
+
+            # For multi-range clips, we need to concatenate
+            # For now, use the first range only (simplest implementation)
+            # TODO: Support multi-range concatenation
+            first_range = keep_ms[0]
+            start_s = first_range[0] / 1000.0
+            end_s = first_range[1] / 1000.0
+
+            logger.info(f"Rendering clip {clip_num}: {start_s:.2f}s - {end_s:.2f}s -> {output_filename}")
+
+            try:
+                trim_result = trim_video(
+                    input_path=request.path,
+                    start=start_s,
+                    end=end_s,
+                    output_path=output_path,
+                )
+
+                results.append(MakeClipsClipResult(
+                    clip_id=clip.get("clip_id", f"clip_{clip_num}"),
+                    output_path=trim_result["output_path"],
+                    keep_ms=keep_ms,
+                    total_ms=clip.get("total_ms", int((end_s - start_s) * 1000)),
+                    title=clip.get("title", f"Clip {clip_num}"),
+                ))
+            except Exception as e:
+                logger.error(f"Failed to render clip {clip_num}: {e}")
+                # Continue with other clips
+
+        if not results:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to render any clips",
+            )
+
+        logger.info(f"Make-clips complete: {len(results)} clips rendered")
+
+        return MakeClipsResponse(
+            clips=results,
+            meta={
+                "input_path": request.path,
+                "output_prefix": request.output_prefix,
+                "segments_transcribed": len(segments),
+                "clips_planned": len(planned_clips),
+                "clips_rendered": len(results),
+                "planner": plan_result.get("meta", {}).get("planner", "ai_labels"),
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Make-clips failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Make-clips failed: {str(e)}",
         )

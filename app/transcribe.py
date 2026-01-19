@@ -92,10 +92,85 @@ def transcribe_audio(
     return full_text, segments, detected_language, duration
 
 
+def chunk_segments(
+    segments: list[dict],
+    max_segment_ms: int,
+) -> list[dict]:
+    """
+    Split long segments into smaller chunks.
+
+    Any segment with duration_ms > max_segment_ms is split by words
+    into subsegments that respect the max duration.
+
+    Args:
+        segments: List of segment dicts with start, end, start_ms, end_ms, text
+        max_segment_ms: Maximum segment duration in milliseconds
+
+    Returns:
+        New list of segments with long segments chunked
+    """
+    chunked = []
+
+    for seg in segments:
+        duration_ms = seg["end_ms"] - seg["start_ms"]
+
+        # If segment is short enough, keep as-is
+        if duration_ms <= max_segment_ms:
+            chunked.append(seg.copy())
+            continue
+
+        # Split long segment by words
+        text = seg["text"]
+        words = text.split()
+
+        if len(words) <= 1:
+            # Can't split single word, keep as-is
+            chunked.append(seg.copy())
+            continue
+
+        # Calculate approximate ms per word
+        ms_per_word = duration_ms / len(words)
+
+        # Determine how many words fit in max_segment_ms
+        words_per_chunk = max(1, int(max_segment_ms / ms_per_word))
+
+        # Split into chunks
+        start_ms = seg["start_ms"]
+        word_idx = 0
+
+        while word_idx < len(words):
+            chunk_words = words[word_idx : word_idx + words_per_chunk]
+            chunk_word_count = len(chunk_words)
+
+            # Calculate chunk timing
+            chunk_duration_ms = int(chunk_word_count * ms_per_word)
+            end_ms = start_ms + chunk_duration_ms
+
+            # Clamp end_ms to segment end
+            if end_ms > seg["end_ms"] or word_idx + chunk_word_count >= len(words):
+                end_ms = seg["end_ms"]
+
+            chunk_text = " ".join(chunk_words)
+
+            chunked.append({
+                "start": round(start_ms / 1000, 3),
+                "end": round(end_ms / 1000, 3),
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "text": chunk_text,
+            })
+
+            start_ms = end_ms
+            word_idx += words_per_chunk
+
+    return chunked
+
+
 def transcribe_media(
     input_path: str,
     model_name: Optional[str] = None,
     language: Optional[str] = None,
+    granularity: Optional[str] = None,
 ) -> dict:
     """
     Full transcription pipeline: extract audio and transcribe.
@@ -104,11 +179,13 @@ def transcribe_media(
         input_path: Path to media file
         model_name: Whisper model name (default from settings)
         language: Language code or None for auto-detect
+        granularity: "default" or "chunked" - if chunked, splits long segments
 
     Returns:
         Response dict with text, segments, and metadata
     """
     model_name = model_name or settings.DEFAULT_MODEL
+    granularity = granularity or "default"
 
     # Ensure temp directory exists
     os.makedirs(settings.TMP_DIR, exist_ok=True)
@@ -132,6 +209,10 @@ def transcribe_media(
             language,
         )
 
+        # Apply chunking if requested
+        if granularity == "chunked":
+            segments = chunk_segments(segments, settings.MAX_SEGMENT_MS)
+
         return {
             "text": full_text,
             "segments": segments,
@@ -140,6 +221,7 @@ def transcribe_media(
                 "duration_s": round(duration, 2) if duration else None,
                 "engine": "faster-whisper",
                 "model": model_name,
+                "granularity": granularity,
             },
         }
     finally:
